@@ -6,7 +6,7 @@ from groq import Groq
 import yfinance as yf
 import pandas as pd
 
-from idx_data_sources import DataSourceManager
+from idx_data_resources import DataSourceManager
 
 app = FastAPI()
 
