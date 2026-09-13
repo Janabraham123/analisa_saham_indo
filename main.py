@@ -40,7 +40,7 @@ async def telegram_webhook(request: Request):
                     {"role": "system", "content": SYSTEM_INSTRUCTION},
                     {"role": "user", "content": user_message}
                 ],
-                model="llama-3.3-70b-versatile",
+                model="openai/gpt-oss-120b",
             )
 
             jawaban = chat_completion.choices[0].message.content
