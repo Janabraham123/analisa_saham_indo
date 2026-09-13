@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+python-telegram-bot
+google-genai
+pandas
+requests
