@@ -1,29 +1,28 @@
 import os
 from fastapi import FastAPI, Request
 from telegram import Update, Bot
-from google import genai
+from groq import Groq
 
 app = FastAPI()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 bot = Bot(token=TELEGRAM_TOKEN)
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
+client = Groq(api_key=GROQ_API_KEY)
 
-# Persona dan aturan diskusi saham Anda
 SYSTEM_INSTRUCTION = """
-Kamu adalah partner diskusi dan asisten trading saham profesional di Bursa Efek Indonesia (IHSG).
-Gaya bicaramu santai, to the point, objektif, dan suportif layaknya rekan diskusi trading.
-Prinsip analisis:
-- Fokus pada Price Action, Support & Resistance, Moving Average (MA20, MA50, MA200), RSI, dan Volume.
-- Selalu utamakan risk management (Risk-to-Reward Ratio, Stop Loss, dan batas alokasi modal).
-- Jawab pertanyaan umum maupun analisis saham secara fleksibel dan lugas.
+Peran: Partner dan Asisten Analisis Saham Indonesia (IHSG).
+Gaya Komunikasi: Lugas, santai, profesional, dan to-the-point layaknya rekan diskusi trading.
+Prinsip Analisis:
+1. Prioritaskan Price Action, Support & Resistance, MA20/MA50, RSI, dan Konfirmasi Volume.
+2. Selalu tekankan manajemen risiko (Risk-to-Reward Ratio, Stop Loss ketat, dan batas alokasi).
+3. Respons pertanyaan umum seputar pasar modal maupun permintaan teknikal ticker saham tertentu secara terstruktur.
 """
 
 @app.get("/")
 def home():
-    return {"status": "Bot Aktif"}
+    return {"status": "Bot Groq Berjalan Aktif"}
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
@@ -34,14 +33,20 @@ async def telegram_webhook(request: Request):
         chat_id = update.message.chat_id
         user_message = update.message.text.strip()
 
-        # Bot langsung memproses semua teks yang masuk sebagai obrolan
-        prompt = f"{SYSTEM_INSTRUCTION}\n\nPertanyaan/Diskusi User: {user_message}"
+        try:
+            # Kirim request ke Groq API
+            chat_completion = client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": SYSTEM_INSTRUCTION},
+                    {"role": "user", "content": user_message}
+                ],
+                model="llama-3.3-70b-versatile",
+            )
 
-        response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt
-        )
+            jawaban = chat_completion.choices[0].message.content
+            await bot.send_message(chat_id=chat_id, text=jawaban)
 
-        await bot.send_message(chat_id=chat_id, text=response.text)
+        except Exception as e:
+            await bot.send_message(chat_id=chat_id, text=f"⚠️ Kendala sistem: {str(e)}")
 
     return {"status": "ok"}
