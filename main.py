@@ -1,14 +1,21 @@
 import os
+import re
+import time
 
 from fastapi import FastAPI, Request
 from telegram import Update, Bot
 from groq import Groq
-import yfinance as yf
 import pandas as pd
 
 from idx_data_resources import DataSourceManager
 
+
 app = FastAPI()
+
+
+# ============================================================
+# ENVIRONMENT
+# ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -18,29 +25,78 @@ client = Groq(api_key=GROQ_API_KEY)
 
 TELEGRAM_MAX_LENGTH = 4096
 
-# Satu instance dipakai di seluruh bot (cache internal tersimpan di sini).
+
+# ============================================================
+# DATA SOURCE MANAGER
+# ============================================================
+
 dsm = DataSourceManager()
 
+
+# ============================================================
+# SYSTEM INSTRUCTION
+# ============================================================
+
 SYSTEM_INSTRUCTION = """
-Peran: Partner dan Asisten Analisis Saham Indonesia (IHSG).
-Gaya Komunikasi: Lugas, santai, profesional, dan to-the-point layaknya rekan diskusi trading.
-Prinsip Analisis:
-1. Prioritaskan Price Action, Support & Resistance, MA20/MA50, RSI, dan Konfirmasi Volume.
-2. Selalu tekankan manajemen risiko (Risk-to-Reward Ratio, Stop Loss ketat, dan batas alokasi).
-3. Respons pertanyaan umum seputar pasar modal maupun permintaan teknikal ticker saham tertentu secara terstruktur.
+Peran:
+Kamu adalah Partner dan Asisten Analisis Saham Indonesia (IHSG).
+
+Gaya komunikasi:
+- Lugas
+- Santai
+- Profesional
+- To-the-point
+- Seperti rekan diskusi pasar modal
+
+Prinsip analisis:
+1. Prioritaskan Price Action.
+2. Gunakan Support & Resistance.
+3. Gunakan MA20 dan MA50.
+4. Gunakan RSI.
+5. Perhatikan konfirmasi volume.
+6. Bedakan dengan jelas antara data harga saat ini,
+   data historis, dan hasil analisis teknikal.
+7. Jika DATA REAL-TIME diberikan oleh sistem,
+   gunakan angka tersebut sebagai sumber utama.
+8. Jangan mengarang harga, volume, market cap,
+   atau angka teknikal yang tidak diberikan.
+9. Jika data tidak tersedia, katakan bahwa data tidak tersedia.
+10. Jangan mengklaim memiliki akses data yang sebenarnya tidak diberikan.
 """
 
-# Watchlist populer untuk fitur market overview (top gainers/losers).
-# Yahoo Finance tidak menyediakan endpoint "top movers IDX" langsung,
-# jadi kita hitung sendiri dari watchlist saham-saham besar/LQ45.
+
+# ============================================================
+# WATCHLIST
+# ============================================================
+
 WATCHLIST = [
-    "BBCA", "BBRI", "BMRI", "BBNI", "TLKM", "ASII", "UNVR", "ICBP",
-    "ADRO", "PGAS", "PTBA", "ANTM", "INCO", "MDKA", "GOTO", "BUKA",
-    "EMTK", "KLBF", "INDF", "SMGR",
+    "BBCA",
+    "BBRI",
+    "BMRI",
+    "BBNI",
+    "TLKM",
+    "ASII",
+    "UNVR",
+    "ICBP",
+    "ADRO",
+    "PGAS",
+    "PTBA",
+    "ANTM",
+    "INCO",
+    "MDKA",
+    "GOTO",
+    "BUKA",
+    "EMTK",
+    "KLBF",
+    "INDF",
+    "SMGR",
 ]
 
-# Kamus kecil nama perusahaan -> ticker untuk fitur pencarian.
-# Cakupan terbatas pada saham-saham populer/LQ45, bukan seluruh 958 saham IDX.
+
+# ============================================================
+# COMPANY DIRECTORY
+# ============================================================
+
 COMPANY_DIRECTORY = {
     "BBCA": "Bank Central Asia",
     "BBRI": "Bank Rakyat Indonesia",
@@ -70,583 +126,1653 @@ COMPANY_DIRECTORY = {
 }
 
 
-def to_yahoo_ticker(ticker: str) -> str:
-    """Tambahkan suffix .JK untuk saham Indonesia jika belum ada."""
-    ticker = ticker.strip().upper()
-    if not ticker.endswith(".JK"):
-        ticker = f"{ticker}.JK"
+# ============================================================
+# TICKER CACHE
+# ============================================================
+
+# Daftar seluruh ticker dari dataset GitHub disimpan sementara
+# agar tidak dipanggil pada setiap pesan Telegram.
+
+ALL_TICKERS_CACHE = {
+    "data": set(),
+    "expires_at": 0,
+}
+
+ALL_TICKERS_CACHE_TTL = 24 * 60 * 60  # 24 jam
+
+
+def normalize_ticker(ticker: str) -> str:
+    """
+    Mengubah:
+        BUMI
+        bumi
+        BUMI.JK
+        bumi.jk
+
+    menjadi:
+        BUMI
+    """
+    ticker = str(ticker).strip().upper()
+
+    if ticker.endswith(".JK"):
+        ticker = ticker[:-3]
+
     return ticker
 
+
+def get_known_tickers() -> set:
+    """
+    Mengambil seluruh ticker yang tersedia di dataset GitHub.
+
+    Ini penting agar ticker seperti BUMI, yang tidak ada
+    di WATCHLIST/COMPANY_DIRECTORY, tetap dapat dikenali
+    dalam chat bebas.
+    """
+
+    now = time.time()
+
+    # Gunakan cache jika masih berlaku
+    if (
+        ALL_TICKERS_CACHE["data"]
+        and now < ALL_TICKERS_CACHE["expires_at"]
+    ):
+        return ALL_TICKERS_CACHE["data"]
+
+    known_tickers = set()
+
+    # Selalu masukkan watchlist dan company directory
+    known_tickers.update(
+        normalize_ticker(t)
+        for t in WATCHLIST
+    )
+
+    known_tickers.update(
+        normalize_ticker(t)
+        for t in COMPANY_DIRECTORY.keys()
+    )
+
+    # Ambil seluruh ticker dari dataset
+    try:
+        tickers = dsm.github.get_available_stocks()
+
+        if tickers:
+            for ticker in tickers:
+                normalized = normalize_ticker(ticker)
+
+                if normalized:
+                    known_tickers.add(normalized)
+
+    except Exception:
+        # Jika GitHub gagal, bot tetap menggunakan
+        # ticker dari watchlist + company directory.
+        pass
+
+    # Simpan cache
+    ALL_TICKERS_CACHE["data"] = known_tickers
+    ALL_TICKERS_CACHE["expires_at"] = now + ALL_TICKERS_CACHE_TTL
+
+    return known_tickers
+
+
+# ============================================================
+# UTILITY
+# ============================================================
 
 def fmt_num(n, decimals=2):
     if n is None:
         return "N/A"
+
     try:
         return f"{n:,.{decimals}f}"
+
     except (TypeError, ValueError):
         return str(n)
 
 
-def split_message(text: str, max_length: int = TELEGRAM_MAX_LENGTH):
-    """Pecah teks panjang jadi beberapa bagian agar muat di batas pesan Telegram."""
+def split_message(
+    text: str,
+    max_length: int = TELEGRAM_MAX_LENGTH
+):
+    """
+    Telegram memiliki batas panjang pesan.
+    Fungsi ini memecah pesan panjang menjadi beberapa bagian.
+    """
+
     chunks = []
+
     while len(text) > max_length:
-        split_at = text.rfind("\n", 0, max_length)
+
+        split_at = text.rfind(
+            "\n",
+            0,
+            max_length
+        )
+
         if split_at == -1:
             split_at = max_length
+
         chunks.append(text[:split_at])
+
         text = text[split_at:].lstrip("\n")
+
     chunks.append(text)
+
     return chunks
 
 
-def compute_rsi(close: pd.Series, period: int = 14) -> float:
-    """Hitung RSI (Relative Strength Index) manual pakai pandas."""
+# ============================================================
+# RSI
+# ============================================================
+
+def compute_rsi(
+    close: pd.Series,
+    period: int = 14
+) -> float:
+
     delta = close.diff()
+
     gain = delta.clip(lower=0)
+
     loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(window=period).mean()
-    avg_loss = loss.rolling(window=period).mean()
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
-    rsi = 100 - (100 / (1 + rs))
-    return float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else None
+
+    avg_gain = gain.rolling(
+        window=period
+    ).mean()
+
+    avg_loss = loss.rolling(
+        window=period
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(
+        0,
+        pd.NA
+    )
+
+    rsi = 100 - (
+        100 / (1 + rs)
+    )
+
+    value = rsi.iloc[-1]
+
+    if pd.isna(value):
+        return None
+
+    return float(value)
 
 
-# ----------------------------------------------------------------------
-# FITUR 1: MARKET OVERVIEW
-# ----------------------------------------------------------------------
+# ============================================================
+# MARKET OVERVIEW
+# ============================================================
+
 def get_market_overview() -> str:
+
     ihsg = dsm.yahoo.get_ihsg()
+
     if ihsg.empty:
         return "⚠️ Gagal mengambil data IHSG saat ini."
 
     last_close = ihsg["Close"].iloc[-1]
-    prev_close = ihsg["Close"].iloc[-2] if len(ihsg) > 1 else last_close
+
+    prev_close = (
+        ihsg["Close"].iloc[-2]
+        if len(ihsg) > 1
+        else last_close
+    )
+
     change = last_close - prev_close
-    change_pct = (change / prev_close) * 100 if prev_close else 0
+
+    change_pct = (
+        (change / prev_close) * 100
+        if prev_close
+        else 0
+    )
+
     volume = ihsg["Volume"].iloc[-1]
 
-    # Hitung perubahan harian tiap saham di watchlist untuk top gainers/losers
     movers = []
-    for t in WATCHLIST:
+
+    for ticker in WATCHLIST:
+
         try:
-            hist = dsm.yahoo.get_history(t, period="5d")
+            hist = dsm.yahoo.get_history(
+                ticker,
+                period="5d"
+            )
+
             if len(hist) < 2:
                 continue
+
             last = hist["Close"].iloc[-1]
+
             prev = hist["Close"].iloc[-2]
-            pct = ((last - prev) / prev) * 100 if prev else 0
-            movers.append((t, last, pct))
+
+            pct = (
+                ((last - prev) / prev) * 100
+                if prev
+                else 0
+            )
+
+            movers.append(
+                (
+                    ticker,
+                    last,
+                    pct
+                )
+            )
+
         except Exception:
             continue
 
-    movers.sort(key=lambda x: x[2], reverse=True)
+    movers.sort(
+        key=lambda x: x[2],
+        reverse=True
+    )
+
     top_gainers = movers[:3]
+
     top_losers = movers[-3:][::-1]
 
     lines = [
         "📊 *Ringkasan Pasar (IHSG)*",
-        f"Terakhir: {fmt_num(last_close)}  ({'+' if change >= 0 else ''}{fmt_num(change)} / {change_pct:+.2f}%)",
+
+        (
+            f"Terakhir: {fmt_num(last_close)} "
+            f"({'+' if change >= 0 else ''}"
+            f"{fmt_num(change)} / "
+            f"{change_pct:+.2f}%)"
+        ),
+
         f"Volume: {fmt_num(volume, 0)}",
+
         "",
+
         "🟢 Top Gainers (watchlist):",
     ]
-    for t, price, pct in top_gainers:
-        lines.append(f"  {t}: {fmt_num(price)} ({pct:+.2f}%)")
+
+    for ticker, price, pct in top_gainers:
+
+        lines.append(
+            f"  {ticker}: "
+            f"{fmt_num(price)} "
+            f"({pct:+.2f}%)"
+        )
 
     lines.append("")
-    lines.append("🔴 Top Losers (watchlist):")
-    for t, price, pct in top_losers:
-        lines.append(f"  {t}: {fmt_num(price)} ({pct:+.2f}%)")
+
+    lines.append(
+        "🔴 Top Losers (watchlist):"
+    )
+
+    for ticker, price, pct in top_losers:
+
+        lines.append(
+            f"  {ticker}: "
+            f"{fmt_num(price)} "
+            f"({pct:+.2f}%)"
+        )
 
     lines.append("")
-    lines.append("_Catatan: top gainers/losers dihitung dari watchlist saham populer, bukan seluruh saham IDX._")
+
+    lines.append(
+        "_Catatan: top gainers/losers "
+        "dihitung dari watchlist saham populer, "
+        "bukan seluruh saham IDX._"
+    )
 
     return "\n".join(lines)
 
 
-# ----------------------------------------------------------------------
-# FITUR 2: INFO SAHAM
-#
-# PERUBAHAN PENTING: harga sekarang diambil dari YahooFinanceSource
-# (yang menarik dari .history(), bukan dari tk.info yang sering
-# basi/salah cache untuk saham IDX kurang likuid), lalu disilang-cek
-# dengan hasil scraping Google Finance. Kalau selisihnya besar, bot
-# kasih peringatan eksplisit alih-alih diam-diam menampilkan angka
-# yang salah — inilah yang menyebabkan kasus harga DEWA ~1000-an
-# kemarin.
-# ----------------------------------------------------------------------
+# ============================================================
+# STOCK INFO
+# ============================================================
+
 def get_stock_info(ticker: str) -> str:
+
+    ticker = normalize_ticker(ticker)
+
     info = dsm.yahoo.get_stock_info(ticker)
 
     if not info or info.price is None:
-        return f"⚠️ Data untuk ticker *{ticker.upper()}* tidak ditemukan. Pastikan kode saham benar (contoh: BBCA, TLKM)."
+
+        return (
+            f"⚠️ Data untuk ticker "
+            f"*{ticker}* tidak ditemukan.\n\n"
+            "Pastikan kode saham benar."
+        )
 
     verified = dsm.get_verified_price(ticker)
-    price = verified["price_to_use"] or info.price
+
+    price = (
+        verified["price_to_use"]
+        or info.price
+    )
 
     lines = [
-        f"📈 *{info.name} ({ticker.upper()})*",
-        f"Harga: {fmt_num(price)}"
-        + (f"  ({info.change_pct:+.2f}%)" if info.change_pct is not None else ""),
+        f"📈 *{info.name} ({ticker})*",
+
+        (
+            f"Harga: {fmt_num(price)}"
+            + (
+                f"  ({info.change_pct:+.2f}%)"
+                if info.change_pct is not None
+                else ""
+            )
+        ),
+
         f"Volume: {fmt_num(info.volume, 0)}",
+
         f"Market Cap: {fmt_num(info.market_cap, 0)}",
+
         f"P/E Ratio: {fmt_num(info.pe_ratio)}",
-        f"52W High/Low: {fmt_num(info.week52_high)} / {fmt_num(info.week52_low)}",
+
+        (
+            f"52W High/Low: "
+            f"{fmt_num(info.week52_high)} / "
+            f"{fmt_num(info.week52_low)}"
+        ),
     ]
 
     if verified["flagged"]:
+
         lines.append("")
+
         lines.append(
-            f"⚠️ Harga Yahoo ({fmt_num(verified['yahoo_price'])}) beda "
-            f"{verified['diff_pct']:.1f}% dari Google Finance "
-            f"({fmt_num(verified['scraped_price'])}). Disarankan cek ulang manual."
+            f"⚠️ Harga Yahoo "
+            f"({fmt_num(verified['yahoo_price'])}) "
+            f"beda {verified['diff_pct']:.1f}% "
+            f"dari Google Finance "
+            f"({fmt_num(verified['scraped_price'])})."
+        )
+
+        lines.append(
+            "Disarankan melakukan pengecekan manual."
         )
 
     return "\n".join(lines)
 
 
-# ----------------------------------------------------------------------
-# FITUR 3: ANALISIS TEKNIKAL
-# ----------------------------------------------------------------------
-def get_technical_analysis(ticker: str, period: str = "6mo") -> str:
-    hist = dsm.yahoo.get_history(ticker, period=period)
+# ============================================================
+# TECHNICAL ANALYSIS
+# ============================================================
+
+def get_technical_analysis(
+    ticker: str,
+    period: str = "6mo"
+) -> str:
+
+    ticker = normalize_ticker(ticker)
+
+    hist = dsm.yahoo.get_history(
+        ticker,
+        period=period
+    )
 
     if hist.empty or len(hist) < 20:
-        return f"⚠️ Data historis untuk *{ticker.upper()}* tidak cukup untuk analisis teknikal."
+
+        return (
+            f"⚠️ Data historis untuk "
+            f"*{ticker}* tidak cukup "
+            "untuk analisis teknikal."
+        )
 
     close = hist["Close"]
+
     last_price = close.iloc[-1]
-    ma20 = close.rolling(window=20).mean().iloc[-1]
-    ma50 = close.rolling(window=50).mean().iloc[-1] if len(close) >= 50 else None
+
+    ma20 = (
+        close
+        .rolling(window=20)
+        .mean()
+        .iloc[-1]
+    )
+
+    ma50 = None
+
+    if len(close) >= 50:
+
+        ma50 = (
+            close
+            .rolling(window=50)
+            .mean()
+            .iloc[-1]
+        )
+
     rsi = compute_rsi(close)
-    avg_volume = hist["Volume"].tail(20).mean()
+
+    avg_volume = (
+        hist["Volume"]
+        .tail(20)
+        .mean()
+    )
+
     last_volume = hist["Volume"].iloc[-1]
 
-    trend_ma20 = "di atas MA20 (bullish jangka pendek)" if last_price > ma20 else "di bawah MA20 (bearish jangka pendek)"
+    if last_price > ma20:
+
+        trend_ma20 = (
+            "di atas MA20 "
+            "(bullish jangka pendek)"
+        )
+
+    else:
+
+        trend_ma20 = (
+            "di bawah MA20 "
+            "(bearish jangka pendek)"
+        )
+
     trend_ma50 = ""
+
     if ma50 is not None:
-        trend_ma50 = "di atas MA50 (bullish jangka menengah)" if last_price > ma50 else "di bawah MA50 (bearish jangka menengah)"
+
+        if last_price > ma50:
+
+            trend_ma50 = (
+                "di atas MA50 "
+                "(bullish jangka menengah)"
+            )
+
+        else:
+
+            trend_ma50 = (
+                "di bawah MA50 "
+                "(bearish jangka menengah)"
+            )
 
     if rsi is None:
-        rsi_note = "N/A"
-    elif rsi >= 70:
-        rsi_note = f"{rsi:.1f} (overbought)"
-    elif rsi <= 30:
-        rsi_note = f"{rsi:.1f} (oversold)"
-    else:
-        rsi_note = f"{rsi:.1f} (netral)"
 
-    volume_note = "di atas rata-rata 20 hari" if last_volume > avg_volume else "di bawah rata-rata 20 hari"
+        rsi_note = "N/A"
+
+    elif rsi >= 70:
+
+        rsi_note = (
+            f"{rsi:.1f} (overbought)"
+        )
+
+    elif rsi <= 30:
+
+        rsi_note = (
+            f"{rsi:.1f} (oversold)"
+        )
+
+    else:
+
+        rsi_note = (
+            f"{rsi:.1f} (netral)"
+        )
+
+    volume_note = (
+        "di atas rata-rata 20 hari"
+        if last_volume > avg_volume
+        else "di bawah rata-rata 20 hari"
+    )
 
     lines = [
-        f"🔍 *Analisis Teknikal: {ticker.upper()}*",
-        f"Harga terakhir: {fmt_num(last_price)}",
-        f"MA20: {fmt_num(ma20)} → harga {trend_ma20}",
+
+        f"🔍 *Analisis Teknikal: {ticker}*",
+
+        f"Harga terakhir: "
+        f"{fmt_num(last_price)}",
+
+        (
+            f"MA20: {fmt_num(ma20)} "
+            f"→ harga {trend_ma20}"
+        ),
     ]
+
     if ma50 is not None:
-        lines.append(f"MA50: {fmt_num(ma50)} → harga {trend_ma50}")
-    lines.append(f"RSI(14): {rsi_note}")
-    lines.append(f"Volume: {fmt_num(last_volume, 0)} ({volume_note})")
+
+        lines.append(
+            f"MA50: {fmt_num(ma50)} "
+            f"→ harga {trend_ma50}"
+        )
+
+    lines.append(
+        f"RSI(14): {rsi_note}"
+    )
+
+    lines.append(
+        f"Volume: {fmt_num(last_volume, 0)} "
+        f"({volume_note})"
+    )
 
     return "\n".join(lines)
 
 
-# ----------------------------------------------------------------------
-# FITUR 4: DATA HISTORIS
-# ----------------------------------------------------------------------
-def get_historical_summary(ticker: str, period: str = "1y") -> str:
-    hist = dsm.yahoo.get_history(ticker, period=period)
+# ============================================================
+# HISTORICAL SUMMARY
+# ============================================================
+
+def get_historical_summary(
+    ticker: str,
+    period: str = "1y"
+) -> str:
+
+    ticker = normalize_ticker(ticker)
+
+    hist = dsm.yahoo.get_history(
+        ticker,
+        period=period
+    )
 
     if hist.empty:
-        return f"⚠️ Data historis untuk *{ticker.upper()}* tidak ditemukan."
+
+        return (
+            f"⚠️ Data historis untuk "
+            f"*{ticker}* tidak ditemukan."
+        )
 
     start_price = hist["Close"].iloc[0]
+
     end_price = hist["Close"].iloc[-1]
-    change_pct = ((end_price - start_price) / start_price) * 100
+
+    change_pct = (
+        (end_price - start_price)
+        / start_price
+    ) * 100
+
     high = hist["High"].max()
+
     low = hist["Low"].min()
+
     avg_volume = hist["Volume"].mean()
 
     lines = [
-        f"📜 *Data Historis: {ticker.upper()}* (periode {period})",
-        f"Harga awal: {fmt_num(start_price)}",
-        f"Harga akhir: {fmt_num(end_price)}",
-        f"Perubahan: {change_pct:+.2f}%",
-        f"Tertinggi: {fmt_num(high)}",
-        f"Terendah: {fmt_num(low)}",
-        f"Rata-rata volume: {fmt_num(avg_volume, 0)}",
-        f"Jumlah hari perdagangan: {len(hist)}",
+
+        f"📜 *Data Historis: {ticker}* "
+        f"(periode {period})",
+
+        f"Harga awal: "
+        f"{fmt_num(start_price)}",
+
+        f"Harga akhir: "
+        f"{fmt_num(end_price)}",
+
+        f"Perubahan: "
+        f"{change_pct:+.2f}%",
+
+        f"Tertinggi: "
+        f"{fmt_num(high)}",
+
+        f"Terendah: "
+        f"{fmt_num(low)}",
+
+        f"Rata-rata volume: "
+        f"{fmt_num(avg_volume, 0)}",
+
+        f"Jumlah hari perdagangan: "
+        f"{len(hist)}",
     ]
+
     return "\n".join(lines)
 
 
-# ----------------------------------------------------------------------
-# FITUR 5: BANDINGKAN SAHAM
-# ----------------------------------------------------------------------
-def compare_stocks(tickers: list, period: str = "1y") -> str:
+# ============================================================
+# COMPARE STOCKS
+# ============================================================
+
+def compare_stocks(
+    tickers: list,
+    period: str = "1y"
+) -> str:
+
     if len(tickers) < 2:
-        return "⚠️ Masukkan minimal 2 ticker, dipisah koma. Contoh: /bandingkan BBCA,BBRI,BMRI"
+
+        return (
+            "⚠️ Masukkan minimal 2 ticker, "
+            "dipisah koma.\n\n"
+            "Contoh:\n"
+            "/bandingkan BBCA,BBRI,BMRI"
+        )
+
     if len(tickers) > 5:
+
         tickers = tickers[:5]
 
-    lines = [f"⚖️ *Perbandingan Performa* (periode {period})", ""]
-    results = []
-    for t in tickers:
-        hist = dsm.yahoo.get_history(t, period=period)
-        if hist.empty:
-            lines.append(f"{t.upper()}: data tidak ditemukan")
-            continue
-        start_price = hist["Close"].iloc[0]
-        end_price = hist["Close"].iloc[-1]
-        change_pct = ((end_price - start_price) / start_price) * 100
-        results.append((t.upper(), change_pct))
+    lines = [
+        f"⚖️ *Perbandingan Performa* "
+        f"(periode {period})",
+        "",
+    ]
 
-    results.sort(key=lambda x: x[1], reverse=True)
-    for t, pct in results:
-        lines.append(f"  {t}: {pct:+.2f}%")
+    results = []
+
+    for ticker in tickers:
+
+        ticker = normalize_ticker(ticker)
+
+        hist = dsm.yahoo.get_history(
+            ticker,
+            period=period
+        )
+
+        if hist.empty:
+
+            lines.append(
+                f"{ticker}: "
+                "data tidak ditemukan"
+            )
+
+            continue
+
+        start_price = hist["Close"].iloc[0]
+
+        end_price = hist["Close"].iloc[-1]
+
+        change_pct = (
+            (end_price - start_price)
+            / start_price
+        ) * 100
+
+        results.append(
+            (
+                ticker,
+                change_pct
+            )
+        )
+
+    results.sort(
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    for ticker, pct in results:
+
+        lines.append(
+            f"  {ticker}: "
+            f"{pct:+.2f}%"
+        )
 
     return "\n".join(lines)
 
 
-# ----------------------------------------------------------------------
-# FITUR 6: CARI SAHAM
-# ----------------------------------------------------------------------
+# ============================================================
+# SEARCH STOCKS
+# ============================================================
+
 def search_stocks(query: str) -> str:
-    query_lower = query.strip().lower()
+
+    query_lower = (
+        query
+        .strip()
+        .lower()
+    )
+
     matches = [
+
         (ticker, name)
-        for ticker, name in COMPANY_DIRECTORY.items()
-        if query_lower in ticker.lower() or query_lower in name.lower()
+
+        for ticker, name
+        in COMPANY_DIRECTORY.items()
+
+        if (
+            query_lower in ticker.lower()
+            or query_lower in name.lower()
+        )
     ]
 
     if matches:
-        lines = [f"🔎 *Hasil pencarian: '{query}'*"]
+
+        lines = [
+            f"🔎 *Hasil pencarian: "
+            f"'{query}'*"
+        ]
+
         for ticker, name in matches:
-            lines.append(f"  {ticker} — {name}")
+
+            lines.append(
+                f"  {ticker} — {name}"
+            )
+
         return "\n".join(lines)
 
-    # Fallback: cocokkan ke kode ticker di seluruh dataset (958 saham),
-    # tidak ada nama perusahaan untuk hasil ini karena hanya cocok kode.
     try:
-        all_tickers = dsm.github.get_available_stocks()
-        code_matches = [t for t in all_tickers if query_lower in t.lower()]
+
+        all_tickers = (
+            dsm.github
+            .get_available_stocks()
+        )
+
+        code_matches = [
+
+            normalize_ticker(t)
+
+            for t in all_tickers
+
+            if query_lower
+            in normalize_ticker(t).lower()
+        ]
+
     except Exception:
+
         code_matches = []
 
     if code_matches:
-        lines = [f"🔎 *Hasil pencarian kode: '{query}'*"]
-        for t in code_matches[:20]:
-            lines.append(f"  {t}")
+
+        lines = [
+            f"🔎 *Hasil pencarian kode: "
+            f"'{query}'*"
+        ]
+
+        for ticker in code_matches[:20]:
+
+            lines.append(
+                f"  {ticker}"
+            )
+
         if len(code_matches) > 20:
-            lines.append(f"  ... dan {len(code_matches) - 20} lainnya")
+
+            lines.append(
+                f"  ... dan "
+                f"{len(code_matches) - 20} lainnya"
+            )
+
         lines.append("")
-        lines.append("_Nama perusahaan tidak tersedia untuk hasil ini, hanya cocok kode ticker._")
+
+        lines.append(
+            "_Nama perusahaan tidak tersedia "
+            "untuk hasil ini, hanya cocok "
+            "kode ticker._"
+        )
+
         return "\n".join(lines)
 
     return (
-        f"⚠️ Tidak ditemukan hasil untuk '{query}'.\n"
-        "Kalau kamu tahu kode tickernya, langsung pakai /saham TICKER."
+        f"⚠️ Tidak ditemukan hasil "
+        f"untuk '{query}'.\n\n"
+        "Kalau kamu tahu kode tickernya, "
+        "langsung pakai /saham TICKER."
     )
 
 
-# ----------------------------------------------------------------------
-# DETEKSI KONTEKS UNTUK CHAT BEBAS
-# ----------------------------------------------------------------------
-# Semua ticker yang "dikenal" bot untuk auto-deteksi di chat bebas.
-KNOWN_TICKERS = set(WATCHLIST) | set(COMPANY_DIRECTORY.keys())
+# ============================================================
+# TICKER DETECTION
+# ============================================================
 
-MARKET_KEYWORDS = ["ihsg", "market", "pasar saham", "pasar modal", "bursa"]
-
-
-def detect_tickers_in_text(text: str) -> list:
-    """Cari kode ticker yang dikenal di dalam teks bebas (mis. 'gimana BBCA hari ini?')."""
-    import re
+def detect_tickers_in_text(
+    text: str
+) -> list:
 
     found = []
+
     upper_text = text.upper()
-    for ticker in KNOWN_TICKERS:
-        if re.search(rf"\b{re.escape(ticker)}\b", upper_text):
-            found.append(ticker)
 
-    # Juga cocokkan berdasarkan nama perusahaan (mis. 'saham bank central asia')
+    # --------------------------------------------------------
+    # 1. Ambil seluruh ticker dari dataset
+    # --------------------------------------------------------
+
+    known_tickers = get_known_tickers()
+
+    # Cari ticker menggunakan word boundary.
+    # Contoh:
+    #
+    # "harga BUMI hari ini"
+    #
+    # akan mendeteksi:
+    #
+    # BUMI
+    #
+    # tetapi tidak salah mendeteksi ticker yang
+    # merupakan bagian dari kata lain.
+    #
+    for ticker in known_tickers:
+
+        if not ticker:
+            continue
+
+        pattern = (
+            rf"(?<![A-Z0-9])"
+            rf"{re.escape(ticker)}"
+            rf"(?:\.JK)?"
+            rf"(?![A-Z0-9])"
+        )
+
+        if re.search(
+            pattern,
+            upper_text
+        ):
+
+            if ticker not in found:
+
+                found.append(ticker)
+
+    # --------------------------------------------------------
+    # 2. Cari berdasarkan nama perusahaan
+    # --------------------------------------------------------
+
     text_lower = text.lower()
+
     for ticker, name in COMPANY_DIRECTORY.items():
-        if name.lower() in text_lower and ticker not in found:
+
+        if (
+            name.lower() in text_lower
+            and ticker not in found
+        ):
+
             found.append(ticker)
 
-    return found[:2]  # batasi maksimal 2 ticker per pesan biar respons cepat
+    # Maksimal 2 ticker untuk chat bebas
+    return found[:2]
 
 
-def build_data_context(text: str) -> str:
-    """
-    Bangun konteks data real-time berdasarkan isi pesan bebas.
-    Kalau pesan menyebut IHSG/pasar dan/atau ticker saham tertentu,
-    ambil datanya dari Yahoo Finance untuk dijadikan dasar jawaban LLM.
-    """
+# ============================================================
+# BUILD DATA CONTEXT
+# ============================================================
+
+def build_data_context(
+    text: str
+) -> str:
+
     context_parts = []
+
     text_lower = text.lower()
 
-    if any(keyword in text_lower for keyword in MARKET_KEYWORDS):
+    # --------------------------------------------------------
+    # MARKET DATA
+    # --------------------------------------------------------
+
+    market_keywords = [
+        "ihsg",
+        "market",
+        "pasar saham",
+        "pasar modal",
+        "bursa",
+    ]
+
+    if any(
+        keyword in text_lower
+        for keyword in market_keywords
+    ):
+
         try:
-            context_parts.append(get_market_overview())
+
+            context_parts.append(
+                get_market_overview()
+            )
+
         except Exception:
+
             pass
+
+    # --------------------------------------------------------
+    # STOCK DATA
+    # --------------------------------------------------------
 
     tickers = detect_tickers_in_text(text)
+
     for ticker in tickers:
+
         try:
-            context_parts.append(get_stock_info(ticker))
+
+            context_parts.append(
+                get_stock_info(ticker)
+            )
+
         except Exception:
+
             pass
+
         try:
-            context_parts.append(get_technical_analysis(ticker))
+
+            context_parts.append(
+                get_technical_analysis(
+                    ticker
+                )
+            )
+
         except Exception:
+
             pass
 
     if not context_parts:
+
         return ""
 
-    return "\n\n".join(context_parts)
+    return "\n\n".join(
+        context_parts
+    )
 
 
-# ----------------------------------------------------------------------
-# INFO DATASET & DAFTAR SAHAM
-# (dipindah ke idx_data_sources.GitHubDatasetSource, dipakai lewat dsm.github)
-# ----------------------------------------------------------------------
+# ============================================================
+# DATASET INFO
+# ============================================================
+
 def get_dataset_info_text() -> str:
+
     try:
-        count = len(dsm.github.get_available_stocks())
+
+        count = len(
+            dsm.github
+            .get_available_stocks()
+        )
+
     except Exception:
-        count = "958 (perkiraan, gagal ambil data terbaru)"
+
+        count = (
+            "958 (perkiraan, "
+            "gagal mengambil data terbaru)"
+        )
 
     lines = [
+
         "🗂️ *Info Dataset*",
+
         f"Jumlah saham tercakup: {count}",
+
         "Cakupan historis: 2019 - sekarang",
-        "Sumber data historis: wildangunawan/Dataset-Saham-IDX (GitHub, publik)",
-        "Sumber data real-time: Yahoo Finance (disilang-cek dengan Google Finance)",
-        "Cache internal: 24 jam (dataset) / 5 menit (harga) / 3 menit (scraping)",
+
+        (
+            "Sumber data historis: "
+            "wildaangunawan/Dataset-Saham-IDX "
+            "(GitHub, publik)"
+        ),
+
+        (
+            "Sumber harga saat ini: "
+            "Yahoo Finance"
+        ),
+
+        (
+            "Verifikasi tambahan: "
+            "Google Finance"
+        ),
+
+        (
+            "Cache internal: "
+            "24 jam (dataset) / "
+            "60 detik (harga) / "
+            "3 menit (scraping)"
+        ),
     ]
+
     return "\n".join(lines)
 
+
+# ============================================================
+# AVAILABLE STOCKS
+# ============================================================
 
 def get_available_stocks_text() -> str:
-    try:
-        tickers = dsm.github.get_available_stocks()
-    except Exception:
-        return "⚠️ Gagal mengambil daftar saham saat ini, coba lagi nanti."
 
-    sample = ", ".join(tickers[:30])
+    try:
+
+        tickers = (
+            dsm.github
+            .get_available_stocks()
+        )
+
+    except Exception:
+
+        return (
+            "⚠️ Gagal mengambil daftar "
+            "saham saat ini, coba lagi nanti."
+        )
+
+    sample = ", ".join(
+        normalize_ticker(t)
+        for t in tickers[:30]
+    )
+
     lines = [
+
         "📋 *Daftar Saham Tersedia*",
+
         f"Total: {len(tickers)} saham (IDX)",
+
         "",
+
         f"Contoh 30 pertama: {sample}",
+
         "",
-        "Gunakan /cari KATA_KUNCI untuk mencari ticker berdasarkan nama perusahaan.",
+
+        (
+            "Gunakan /cari KATA_KUNCI "
+            "untuk mencari ticker berdasarkan "
+            "nama perusahaan."
+        ),
     ]
+
     return "\n".join(lines)
 
 
-def get_sector_performance(sector_query: str) -> str:
+# ============================================================
+# SECTOR PERFORMANCE
+# ============================================================
+
+def get_sector_performance(
+    sector_query: str
+) -> str:
+
     try:
-        sectors = dsm.github.get_sectors()
+
+        sectors = (
+            dsm.github
+            .get_sectors()
+        )
+
     except Exception:
-        return "⚠️ Gagal mengambil daftar sektor saat ini, coba lagi nanti."
+
+        return (
+            "⚠️ Gagal mengambil daftar "
+            "sektor saat ini, coba lagi nanti."
+        )
 
     if not sectors:
-        return "⚠️ Daftar sektor kosong/tidak ditemukan."
 
-    query_lower = sector_query.strip().lower()
-    matched = [s for s in sectors if query_lower in s.lower()]
+        return (
+            "⚠️ Daftar sektor kosong/"
+            "tidak ditemukan."
+        )
+
+    query_lower = (
+        sector_query
+        .strip()
+        .lower()
+    )
+
+    matched = [
+
+        sector
+
+        for sector in sectors
+
+        if query_lower in sector.lower()
+    ]
 
     if not matched:
+
         available = ", ".join(sectors)
-        return f"⚠️ Sektor '{sector_query}' tidak ditemukan.\nSektor tersedia: {available}"
+
+        return (
+            f"⚠️ Sektor "
+            f"'{sector_query}' tidak ditemukan.\n"
+            f"Sektor tersedia: {available}"
+        )
 
     sector_name = matched[0]
 
     try:
-        tickers = dsm.github.get_tickers_in_sector(sector_name, limit=10)
+
+        tickers = (
+            dsm.github
+            .get_tickers_in_sector(
+                sector_name,
+                limit=10
+            )
+        )
+
     except Exception:
-        return f"⚠️ Gagal membaca daftar saham untuk sektor {sector_name}."
+
+        return (
+            f"⚠️ Gagal membaca daftar saham "
+            f"untuk sektor {sector_name}."
+        )
 
     if not tickers:
-        return f"⚠️ Tidak ada data ticker yang terbaca untuk sektor {sector_name}."
+
+        return (
+            f"⚠️ Tidak ada data ticker "
+            f"yang terbaca untuk sektor "
+            f"{sector_name}."
+        )
 
     changes = []
-    for t in tickers:
+
+    for ticker in tickers:
+
+        ticker = normalize_ticker(ticker)
+
         try:
-            hist = dsm.yahoo.get_history(t, period="5d")
+
+            hist = (
+                dsm.yahoo
+                .get_history(
+                    ticker,
+                    period="5d"
+                )
+            )
+
             if len(hist) < 2:
                 continue
+
             last = hist["Close"].iloc[-1]
+
             prev = hist["Close"].iloc[-2]
-            pct = ((last - prev) / prev) * 100 if prev else 0
-            changes.append((t, pct))
+
+            pct = (
+                ((last - prev) / prev) * 100
+                if prev
+                else 0
+            )
+
+            changes.append(
+                (
+                    ticker,
+                    pct
+                )
+            )
+
         except Exception:
+
             continue
 
     if not changes:
-        return f"⚠️ Gagal mengambil data harga untuk saham-saham di sektor {sector_name}."
 
-    changes.sort(key=lambda x: x[1], reverse=True)
-    avg_change = sum(c[1] for c in changes) / len(changes)
+        return (
+            f"⚠️ Gagal mengambil data "
+            f"harga untuk saham-saham "
+            f"di sektor {sector_name}."
+        )
+
+    changes.sort(
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    avg_change = (
+        sum(
+            c[1]
+            for c in changes
+        )
+        / len(changes)
+    )
 
     lines = [
-        f"🏭 *Performa Sektor: {sector_name}*",
-        f"Rata-rata perubahan harian: {avg_change:+.2f}% (sampel {len(changes)} saham)",
+
+        f"🏭 *Performa Sektor: "
+        f"{sector_name}*",
+
+        (
+            f"Rata-rata perubahan harian: "
+            f"{avg_change:+.2f}% "
+            f"(sampel {len(changes)} saham)"
+        ),
+
         "",
+
         "🟢 Terbaik:",
     ]
-    for t, pct in changes[:3]:
-        lines.append(f"  {t}: {pct:+.2f}%")
+
+    for ticker, pct in changes[:3]:
+
+        lines.append(
+            f"  {ticker}: "
+            f"{pct:+.2f}%"
+        )
+
     lines.append("")
-    lines.append("🔴 Terburuk:")
-    for t, pct in changes[-3:][::-1]:
-        lines.append(f"  {t}: {pct:+.2f}%")
+
+    lines.append(
+        "🔴 Terburuk:"
+    )
+
+    for ticker, pct in changes[-3:][::-1]:
+
+        lines.append(
+            f"  {ticker}: "
+            f"{pct:+.2f}%"
+        )
+
     lines.append("")
-    lines.append(f"_Catatan: dihitung dari sampel {len(changes)} saham dalam sektor ini, bukan keseluruhan anggota sektor._")
+
+    lines.append(
+        f"_Catatan: dihitung dari sampel "
+        f"{len(changes)} saham dalam sektor ini, "
+        "bukan keseluruhan anggota sektor._"
+    )
 
     return "\n".join(lines)
 
 
-# ----------------------------------------------------------------------
-# HELP TEXT
-# ----------------------------------------------------------------------
+# ============================================================
+# HELP
+# ============================================================
+
 HELP_TEXT = """
 🤖 *Bot Analisa Saham Indonesia*
 
 Perintah yang tersedia:
-/market — ringkasan IHSG + top gainers/losers
-/saham TICKER — info saham (contoh: /saham BBCA)
-/analisa TICKER — analisis teknikal (MA20/MA50, RSI, volume)
-/historis TICKER PERIODE — data historis (contoh: /historis BBCA 1y)
-/bandingkan TICKER1,TICKER2,... — bandingkan performa saham
-/cari KATA_KUNCI — cari ticker dari nama perusahaan atau kode
-/sektor NAMA_SEKTOR — performa saham per sektor (contoh: /sektor Energy)
-/daftar_saham — jumlah & contoh saham yang tercakup di dataset
-/dataset_info — info sumber & cakupan data
 
-Periode yang didukung: 1mo, 3mo, 6mo, 1y, 2y, 5y
+/market
+— Ringkasan IHSG + top gainers/losers
 
-Selain perintah di atas, kamu juga bisa chat bebas untuk diskusi atau tanya opini analisis.
+/saham TICKER
+— Info saham
+Contoh: /saham BBCA
+
+/analisa TICKER
+— Analisis teknikal MA20/MA50, RSI, volume
+Contoh: /analisa BBCA
+
+/historis TICKER PERIODE
+— Data historis
+Contoh: /historis BBCA 1y
+
+/bandingkan TICKER1,TICKER2,...
+— Bandingkan performa saham
+Contoh: /bandingkan BBCA,BBRI,BMRI
+
+/cari KATA_KUNCI
+— Cari ticker dari nama perusahaan atau kode
+Contoh: /cari bank
+
+/sektor NAMA_SEKTOR
+— Performa saham per sektor
+Contoh: /sektor Energy
+
+/daftar_saham
+— Jumlah & contoh saham yang tercakup
+
+/dataset_info
+— Info sumber & cakupan data
+
+Periode yang didukung:
+1mo, 3mo, 6mo, 1y, 2y, 5y
+
+Selain perintah di atas, kamu juga bisa chat
+bebas untuk diskusi dan analisis saham.
 """
 
 
-# ----------------------------------------------------------------------
-# TELEGRAM WEBHOOK
-# ----------------------------------------------------------------------
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
 @app.get("/")
 def home():
-    return {"status": "Bot Groq Berjalan Aktif"}
 
+    return {
+        "status": "Bot Groq Berjalan Aktif"
+    }
+
+
+# ============================================================
+# TELEGRAM WEBHOOK
+# ============================================================
 
 @app.post("/webhook")
-async def telegram_webhook(request: Request):
-    data = await request.json()
-    update = Update.de_json(data, bot)
+async def telegram_webhook(
+    request: Request
+):
 
-    if not (update.message and update.message.text):
-        return {"status": "ok"}
+    data = await request.json()
+
+    update = Update.de_json(
+        data,
+        bot
+    )
+
+    # Abaikan update tanpa pesan teks
+    if not (
+        update.message
+        and update.message.text
+    ):
+
+        return {
+            "status": "ok"
+        }
 
     chat_id = update.message.chat_id
-    text = update.message.text.strip()
+
+    text = (
+        update.message.text
+        .strip()
+    )
 
     try:
-        if text.startswith("/"):
-            parts = text.split(maxsplit=1)
-            command = parts[0].lower().lstrip("/")
-            arg_str = parts[1].strip() if len(parts) > 1 else ""
 
-            if command in ("start", "help"):
+        # ====================================================
+        # COMMAND
+        # ====================================================
+
+        if text.startswith("/"):
+
+            parts = text.split(
+                maxsplit=1
+            )
+
+            command = (
+                parts[0]
+                .lower()
+                .lstrip("/")
+            )
+
+            arg_str = (
+                parts[1].strip()
+                if len(parts) > 1
+                else ""
+            )
+
+            # -----------------------------------------------
+            # START / HELP
+            # -----------------------------------------------
+
+            if command in (
+                "start",
+                "help"
+            ):
+
                 reply = HELP_TEXT
 
+            # -----------------------------------------------
+            # MARKET
+            # -----------------------------------------------
+
             elif command == "market":
-                reply = get_market_overview()
+
+                reply = (
+                    get_market_overview()
+                )
+
+            # -----------------------------------------------
+            # SAHAM
+            # -----------------------------------------------
 
             elif command == "saham":
+
                 if not arg_str:
-                    reply = "⚠️ Gunakan format: /saham TICKER (contoh: /saham BBCA)"
+
+                    reply = (
+                        "⚠️ Gunakan format:\n"
+                        "/saham TICKER\n\n"
+                        "Contoh:\n"
+                        "/saham BBCA"
+                    )
+
                 else:
-                    reply = get_stock_info(arg_str.split()[0])
+
+                    ticker = (
+                        arg_str
+                        .split()[0]
+                    )
+
+                    reply = (
+                        get_stock_info(
+                            ticker
+                        )
+                    )
+
+            # -----------------------------------------------
+            # ANALISA
+            # -----------------------------------------------
 
             elif command == "analisa":
+
                 if not arg_str:
-                    reply = "⚠️ Gunakan format: /analisa TICKER (contoh: /analisa BBCA)"
+
+                    reply = (
+                        "⚠️ Gunakan format:\n"
+                        "/analisa TICKER\n\n"
+                        "Contoh:\n"
+                        "/analisa BBCA"
+                    )
+
                 else:
-                    args = arg_str.split()
+
+                    args = (
+                        arg_str
+                        .split()
+                    )
+
                     ticker = args[0]
-                    period = args[1] if len(args) > 1 else "6mo"
-                    reply = get_technical_analysis(ticker, period)
+
+                    period = (
+                        args[1]
+                        if len(args) > 1
+                        else "6mo"
+                    )
+
+                    reply = (
+                        get_technical_analysis(
+                            ticker,
+                            period
+                        )
+                    )
+
+            # -----------------------------------------------
+            # HISTORIS
+            # -----------------------------------------------
 
             elif command == "historis":
+
                 if not arg_str:
-                    reply = "⚠️ Gunakan format: /historis TICKER PERIODE (contoh: /historis BBCA 1y)"
+
+                    reply = (
+                        "⚠️ Gunakan format:\n"
+                        "/historis TICKER PERIODE\n\n"
+                        "Contoh:\n"
+                        "/historis BBCA 1y"
+                    )
+
                 else:
-                    args = arg_str.split()
+
+                    args = (
+                        arg_str
+                        .split()
+                    )
+
                     ticker = args[0]
-                    period = args[1] if len(args) > 1 else "1y"
-                    reply = get_historical_summary(ticker, period)
+
+                    period = (
+                        args[1]
+                        if len(args) > 1
+                        else "1y"
+                    )
+
+                    reply = (
+                        get_historical_summary(
+                            ticker,
+                            period
+                        )
+                    )
+
+            # -----------------------------------------------
+            # BANDINGKAN
+            # -----------------------------------------------
 
             elif command == "bandingkan":
+
                 if not arg_str:
-                    reply = "⚠️ Gunakan format: /bandingkan TICKER1,TICKER2,... (contoh: /bandingkan BBCA,BBRI,BMRI)"
+
+                    reply = (
+                        "⚠️ Gunakan format:\n"
+                        "/bandingkan "
+                        "TICKER1,TICKER2,...\n\n"
+                        "Contoh:\n"
+                        "/bandingkan "
+                        "BBCA,BBRI,BMRI"
+                    )
+
                 else:
-                    tickers = [t.strip() for t in arg_str.split(",") if t.strip()]
-                    reply = compare_stocks(tickers)
+
+                    tickers = [
+
+                        ticker.strip()
+
+                        for ticker
+                        in arg_str.split(",")
+
+                        if ticker.strip()
+                    ]
+
+                    reply = (
+                        compare_stocks(
+                            tickers
+                        )
+                    )
+
+            # -----------------------------------------------
+            # CARI
+            # -----------------------------------------------
 
             elif command == "cari":
+
                 if not arg_str:
-                    reply = "⚠️ Gunakan format: /cari KATA_KUNCI (contoh: /cari bank)"
+
+                    reply = (
+                        "⚠️ Gunakan format:\n"
+                        "/cari KATA_KUNCI\n\n"
+                        "Contoh:\n"
+                        "/cari bank"
+                    )
+
                 else:
-                    reply = search_stocks(arg_str)
+
+                    reply = (
+                        search_stocks(
+                            arg_str
+                        )
+                    )
+
+            # -----------------------------------------------
+            # SEKTOR
+            # -----------------------------------------------
 
             elif command == "sektor":
+
                 if not arg_str:
-                    reply = "⚠️ Gunakan format: /sektor NAMA_SEKTOR (contoh: /sektor Energy)"
+
+                    reply = (
+                        "⚠️ Gunakan format:\n"
+                        "/sektor NAMA_SEKTOR\n\n"
+                        "Contoh:\n"
+                        "/sektor Energy"
+                    )
+
                 else:
-                    reply = get_sector_performance(arg_str)
+
+                    reply = (
+                        get_sector_performance(
+                            arg_str
+                        )
+                    )
+
+            # -----------------------------------------------
+            # DAFTAR SAHAM
+            # -----------------------------------------------
 
             elif command == "daftar_saham":
-                reply = get_available_stocks_text()
+
+                reply = (
+                    get_available_stocks_text()
+                )
+
+            # -----------------------------------------------
+            # DATASET INFO
+            # -----------------------------------------------
 
             elif command == "dataset_info":
-                reply = get_dataset_info_text()
+
+                reply = (
+                    get_dataset_info_text()
+                )
+
+            # -----------------------------------------------
+            # UNKNOWN COMMAND
+            # -----------------------------------------------
 
             else:
-                reply = "Perintah tidak dikenal. Ketik /help untuk daftar perintah."
+
+                reply = (
+                    "Perintah tidak dikenal.\n\n"
+                    "Ketik /help untuk daftar "
+                    "perintah."
+                )
+
+        # ====================================================
+        # FREE CHAT
+        # ====================================================
 
         else:
-            # Chat bebas -> deteksi apakah pesan menyebut ticker/pasar,
-            # kalau ya ambil data real-time dan sertakan sebagai konteks ke Groq.
-            data_context = build_data_context(text)
 
-            messages = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
-
-            if data_context:
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        "DATA REAL-TIME (diambil dari Yahoo Finance, gunakan ini sebagai dasar "
-                        "analisis, jangan mengarang angka lain di luar data berikut):\n\n"
-                        f"{data_context}"
-                    ),
-                })
-
-            messages.append({"role": "user", "content": text})
-
-            chat_completion = client.chat.completions.create(
-                messages=messages,
-                model="openai/gpt-oss-120b",
+            # Ambil data saham jika terdapat ticker
+            # dalam pesan user.
+            data_context = (
+                build_data_context(text)
             )
-            reply = chat_completion.choices[0].message.content
+
+            messages = [
+                {
+                    "role": "system",
+                    "content":
+                        SYSTEM_INSTRUCTION,
+                }
+            ]
+
+            # Jika data saham ditemukan,
+            # masukkan ke context Groq.
+            if data_context:
+
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "DATA SAHAM TERKINI/HISTORIS "
+                            "YANG BERHASIL DIAMBIL OLEH "
+                            "SISTEM:\n\n"
+
+                            f"{data_context}\n\n"
+
+                            "Gunakan data di atas sebagai "
+                            "dasar jawaban.\n"
+
+                            "Jangan mengarang angka "
+                            "harga, volume, market cap, "
+                            "RSI, MA20, atau MA50 "
+                            "yang tidak terdapat "
+                            "dalam data."
+                        ),
+                    }
+                )
+
+            messages.append(
+                {
+                    "role": "user",
+                    "content": text,
+                }
+            )
+
+            # =================================================
+            # GROQ
+            # =================================================
+
+            chat_completion = (
+                client.chat.completions.create(
+                    messages=messages,
+                    model="openai/gpt-oss-120b",
+                )
+            )
+
+            reply = (
+                chat_completion
+                .choices[0]
+                .message
+                .content
+            )
+
+        # ====================================================
+        # SEND TELEGRAM MESSAGE
+        # ====================================================
 
         for chunk in split_message(reply):
-            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode="Markdown")
+
+            await bot.send_message(
+                chat_id=chat_id,
+                text=chunk,
+                parse_mode="Markdown"
+            )
 
     except Exception as e:
-        await bot.send_message(chat_id=chat_id, text=f"⚠️ Kendala sistem: {str(e)}")
 
-    return {"status": "ok"}
+        error_message = (
+            f"⚠️ Kendala sistem: {str(e)}"
+        )
+
+        await bot.send_message(
+            chat_id=chat_id,
+            text=error_message
+        )
+
+    return {
+        "status": "ok"
+    }
