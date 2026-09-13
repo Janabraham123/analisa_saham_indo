@@ -1,6 +1,5 @@
 fastapi
 uvicorn
 python-telegram-bot
-google-genai
-pandas
+groq
 requests
