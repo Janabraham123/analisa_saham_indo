@@ -1,14 +1,12 @@
 import os
-import time
-import urllib.parse
-from datetime import datetime
 
-import requests
-import yfinance as yf
-import pandas as pd
 from fastapi import FastAPI, Request
 from telegram import Update, Bot
 from groq import Groq
+import yfinance as yf
+import pandas as pd
+
+from idx_data_sources import DataSourceManager
 
 app = FastAPI()
 
@@ -19,6 +17,9 @@ bot = Bot(token=TELEGRAM_TOKEN)
 client = Groq(api_key=GROQ_API_KEY)
 
 TELEGRAM_MAX_LENGTH = 4096
+
+# Satu instance dipakai di seluruh bot (cache internal tersimpan di sini).
+dsm = DataSourceManager()
 
 SYSTEM_INSTRUCTION = """
 Peran: Partner dan Asisten Analisis Saham Indonesia (IHSG).
@@ -115,7 +116,7 @@ def compute_rsi(close: pd.Series, period: int = 14) -> float:
 # FITUR 1: MARKET OVERVIEW
 # ----------------------------------------------------------------------
 def get_market_overview() -> str:
-    ihsg = yf.Ticker("^JKSE").history(period="5d")
+    ihsg = dsm.yahoo.get_ihsg()
     if ihsg.empty:
         return "⚠️ Gagal mengambil data IHSG saat ini."
 
@@ -129,7 +130,7 @@ def get_market_overview() -> str:
     movers = []
     for t in WATCHLIST:
         try:
-            hist = yf.Ticker(to_yahoo_ticker(t)).history(period="5d")
+            hist = dsm.yahoo.get_history(t, period="5d")
             if len(hist) < 2:
                 continue
             last = hist["Close"].iloc[-1]
@@ -166,33 +167,42 @@ def get_market_overview() -> str:
 
 # ----------------------------------------------------------------------
 # FITUR 2: INFO SAHAM
+#
+# PERUBAHAN PENTING: harga sekarang diambil dari YahooFinanceSource
+# (yang menarik dari .history(), bukan dari tk.info yang sering
+# basi/salah cache untuk saham IDX kurang likuid), lalu disilang-cek
+# dengan hasil scraping Google Finance. Kalau selisihnya besar, bot
+# kasih peringatan eksplisit alih-alih diam-diam menampilkan angka
+# yang salah — inilah yang menyebabkan kasus harga DEWA ~1000-an
+# kemarin.
 # ----------------------------------------------------------------------
 def get_stock_info(ticker: str) -> str:
-    yt = to_yahoo_ticker(ticker)
-    tk = yf.Ticker(yt)
-    info = tk.info
+    info = dsm.yahoo.get_stock_info(ticker)
 
-    if not info or info.get("regularMarketPrice") is None:
+    if not info or info.price is None:
         return f"⚠️ Data untuk ticker *{ticker.upper()}* tidak ditemukan. Pastikan kode saham benar (contoh: BBCA, TLKM)."
 
-    name = info.get("longName", ticker.upper())
-    price = info.get("currentPrice") or info.get("regularMarketPrice")
-    prev_close = info.get("previousClose")
-    change = (price - prev_close) if (price and prev_close) else None
-    change_pct = (change / prev_close * 100) if (change and prev_close) else None
-    market_cap = info.get("marketCap")
-    pe_ratio = info.get("trailingPE")
-    volume = info.get("volume")
+    verified = dsm.get_verified_price(ticker)
+    price = verified["price_to_use"] or info.price
 
     lines = [
-        f"📈 *{name} ({ticker.upper()})*",
+        f"📈 *{info.name} ({ticker.upper()})*",
         f"Harga: {fmt_num(price)}"
-        + (f"  ({change_pct:+.2f}%)" if change_pct is not None else ""),
-        f"Volume: {fmt_num(volume, 0)}",
-        f"Market Cap: {fmt_num(market_cap, 0)}",
-        f"P/E Ratio: {fmt_num(pe_ratio)}",
-        f"52W High/Low: {fmt_num(info.get('fiftyTwoWeekHigh'))} / {fmt_num(info.get('fiftyTwoWeekLow'))}",
+        + (f"  ({info.change_pct:+.2f}%)" if info.change_pct is not None else ""),
+        f"Volume: {fmt_num(info.volume, 0)}",
+        f"Market Cap: {fmt_num(info.market_cap, 0)}",
+        f"P/E Ratio: {fmt_num(info.pe_ratio)}",
+        f"52W High/Low: {fmt_num(info.week52_high)} / {fmt_num(info.week52_low)}",
     ]
+
+    if verified["flagged"]:
+        lines.append("")
+        lines.append(
+            f"⚠️ Harga Yahoo ({fmt_num(verified['yahoo_price'])}) beda "
+            f"{verified['diff_pct']:.1f}% dari Google Finance "
+            f"({fmt_num(verified['scraped_price'])}). Disarankan cek ulang manual."
+        )
+
     return "\n".join(lines)
 
 
@@ -200,8 +210,7 @@ def get_stock_info(ticker: str) -> str:
 # FITUR 3: ANALISIS TEKNIKAL
 # ----------------------------------------------------------------------
 def get_technical_analysis(ticker: str, period: str = "6mo") -> str:
-    yt = to_yahoo_ticker(ticker)
-    hist = yf.Ticker(yt).history(period=period)
+    hist = dsm.yahoo.get_history(ticker, period=period)
 
     if hist.empty or len(hist) < 20:
         return f"⚠️ Data historis untuk *{ticker.upper()}* tidak cukup untuk analisis teknikal."
@@ -247,8 +256,7 @@ def get_technical_analysis(ticker: str, period: str = "6mo") -> str:
 # FITUR 4: DATA HISTORIS
 # ----------------------------------------------------------------------
 def get_historical_summary(ticker: str, period: str = "1y") -> str:
-    yt = to_yahoo_ticker(ticker)
-    hist = yf.Ticker(yt).history(period=period)
+    hist = dsm.yahoo.get_history(ticker, period=period)
 
     if hist.empty:
         return f"⚠️ Data historis untuk *{ticker.upper()}* tidak ditemukan."
@@ -285,8 +293,7 @@ def compare_stocks(tickers: list, period: str = "1y") -> str:
     lines = [f"⚖️ *Perbandingan Performa* (periode {period})", ""]
     results = []
     for t in tickers:
-        yt = to_yahoo_ticker(t)
-        hist = yf.Ticker(yt).history(period=period)
+        hist = dsm.yahoo.get_history(t, period=period)
         if hist.empty:
             lines.append(f"{t.upper()}: data tidak ditemukan")
             continue
@@ -322,7 +329,7 @@ def search_stocks(query: str) -> str:
     # Fallback: cocokkan ke kode ticker di seluruh dataset (958 saham),
     # tidak ada nama perusahaan untuk hasil ini karena hanya cocok kode.
     try:
-        all_tickers = get_available_stocks_list()
+        all_tickers = dsm.github.get_available_stocks()
         code_matches = [t for t in all_tickers if query_lower in t.lower()]
     except Exception:
         code_matches = []
@@ -404,84 +411,12 @@ def build_data_context(text: str) -> str:
 
 
 # ----------------------------------------------------------------------
-# INTEGRASI DATASET GITHUB (wildangunawan/Dataset-Saham-IDX)
-# Sumber yang sama dipakai oleh baguskto/saham, diakses langsung dari
-# Python via GitHub API + raw CSV, tanpa perlu menjalankan server Node.
+# INFO DATASET & DAFTAR SAHAM
+# (dipindah ke idx_data_sources.GitHubDatasetSource, dipakai lewat dsm.github)
 # ----------------------------------------------------------------------
-GITHUB_API_BASE = "https://api.github.com/repos/wildangunawan/Dataset-Saham-IDX/contents"
-GITHUB_RAW_BASE = "https://raw.githubusercontent.com/wildangunawan/Dataset-Saham-IDX/master"
-CACHE_TTL = 24 * 60 * 60  # 24 jam, sama seperti cache di baguskto/saham
-
-_cache = {
-    "available_stocks": None, "available_stocks_ts": 0,
-    "sectors": None, "sectors_ts": 0,
-}
-
-
-def get_available_stocks_list() -> list:
-    """Ambil daftar seluruh ticker saham IDX dari dataset GitHub (cache 24 jam)."""
-    now = time.time()
-    if _cache["available_stocks"] and (now - _cache["available_stocks_ts"] < CACHE_TTL):
-        return _cache["available_stocks"]
-
-    resp = requests.get(f"{GITHUB_API_BASE}/Saham/Semua", timeout=15)
-    resp.raise_for_status()
-    files = resp.json()
-    tickers = sorted(
-        f["name"].replace(".csv", "") for f in files if f["name"].endswith(".csv")
-    )
-    _cache["available_stocks"] = tickers
-    _cache["available_stocks_ts"] = now
-    return tickers
-
-
-def get_sector_list() -> list:
-    """Ambil daftar nama sektor IDX-IC dari dataset GitHub (cache 24 jam)."""
-    now = time.time()
-    if _cache["sectors"] and (now - _cache["sectors_ts"] < CACHE_TTL):
-        return _cache["sectors"]
-
-    resp = requests.get(f"{GITHUB_API_BASE}/List%20Emiten/Sectors", timeout=15)
-    resp.raise_for_status()
-    files = resp.json()
-    sectors = sorted(
-        f["name"].replace(".csv", "") for f in files if f["name"].endswith(".csv")
-    )
-    _cache["sectors"] = sectors
-    _cache["sectors_ts"] = now
-    return sectors
-
-
-def get_tickers_in_sector(sector_name: str, limit: int = 10) -> list:
-    """Ambil daftar ticker dalam satu sektor dari file CSV sektor tersebut."""
-    import re
-
-    url = f"{GITHUB_RAW_BASE}/List%20Emiten/Sectors/{urllib.parse.quote(sector_name)}.csv"
-    df = pd.read_csv(url)
-
-    ticker_col = None
-    for candidate in ["Kode", "kode", "Code", "code", "Ticker", "ticker", "Kode Saham", "Symbol"]:
-        if candidate in df.columns:
-            ticker_col = candidate
-            break
-
-    if ticker_col is None:
-        for col in df.columns:
-            sample = df[col].astype(str).head(10)
-            if sample.str.match(r"^[A-Z]{4}$").sum() >= 5:
-                ticker_col = col
-                break
-
-    if ticker_col is None:
-        return []
-
-    tickers = df[ticker_col].astype(str).str.strip().str.upper().tolist()
-    return tickers[:limit]
-
-
 def get_dataset_info_text() -> str:
     try:
-        count = len(get_available_stocks_list())
+        count = len(dsm.github.get_available_stocks())
     except Exception:
         count = "958 (perkiraan, gagal ambil data terbaru)"
 
@@ -490,15 +425,15 @@ def get_dataset_info_text() -> str:
         f"Jumlah saham tercakup: {count}",
         "Cakupan historis: 2019 - sekarang",
         "Sumber data historis: wildangunawan/Dataset-Saham-IDX (GitHub, publik)",
-        "Sumber data real-time: Yahoo Finance",
-        "Cache internal: 24 jam",
+        "Sumber data real-time: Yahoo Finance (disilang-cek dengan Google Finance)",
+        "Cache internal: 24 jam (dataset) / 5 menit (harga) / 3 menit (scraping)",
     ]
     return "\n".join(lines)
 
 
 def get_available_stocks_text() -> str:
     try:
-        tickers = get_available_stocks_list()
+        tickers = dsm.github.get_available_stocks()
     except Exception:
         return "⚠️ Gagal mengambil daftar saham saat ini, coba lagi nanti."
 
@@ -516,7 +451,7 @@ def get_available_stocks_text() -> str:
 
 def get_sector_performance(sector_query: str) -> str:
     try:
-        sectors = get_sector_list()
+        sectors = dsm.github.get_sectors()
     except Exception:
         return "⚠️ Gagal mengambil daftar sektor saat ini, coba lagi nanti."
 
@@ -533,7 +468,7 @@ def get_sector_performance(sector_query: str) -> str:
     sector_name = matched[0]
 
     try:
-        tickers = get_tickers_in_sector(sector_name, limit=10)
+        tickers = dsm.github.get_tickers_in_sector(sector_name, limit=10)
     except Exception:
         return f"⚠️ Gagal membaca daftar saham untuk sektor {sector_name}."
 
@@ -543,7 +478,7 @@ def get_sector_performance(sector_query: str) -> str:
     changes = []
     for t in tickers:
         try:
-            hist = yf.Ticker(to_yahoo_ticker(t)).history(period="5d")
+            hist = dsm.yahoo.get_history(t, period="5d")
             if len(hist) < 2:
                 continue
             last = hist["Close"].iloc[-1]
@@ -681,7 +616,7 @@ async def telegram_webhook(request: Request):
                 reply = get_dataset_info_text()
 
             else:
-                reply = f"Perintah tidak dikenal. Ketik /help untuk daftar perintah."
+                reply = "Perintah tidak dikenal. Ketik /help untuk daftar perintah."
 
         else:
             # Chat bebas -> deteksi apakah pesan menyebut ticker/pasar,
