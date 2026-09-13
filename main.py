@@ -153,6 +153,43 @@ def compute_rsi(close: pd.Series, period: int = 14) -> float:
     return float(value)
 
 
+def compute_rsi_series(close: pd.Series, period: int = 14) -> pd.Series:
+    """Sama seperti compute_rsi tapi mengembalikan seluruh series (dibutuhkan untuk StochRSI)."""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    return 100 - (100 / (1 + rs))
+
+
+def compute_stochrsi(close: pd.Series, rsi_period: int = 14, stoch_period: int = 14,
+                      k_smooth: int = 3, d_smooth: int = 3):
+    """
+    Stochastic RSI — sama seperti indikator StochRSI yang dipakai trader
+    untuk deteksi jenuh beli/jenuh jual lebih sensitif dari RSI biasa.
+    Return (%K, %D) dalam skala 0-100, atau (None, None) kalau data tidak cukup.
+    """
+    rsi_series = compute_rsi_series(close, rsi_period)
+    min_rsi = rsi_series.rolling(window=stoch_period).min()
+    max_rsi = rsi_series.rolling(window=stoch_period).max()
+
+    denom = (max_rsi - min_rsi).replace(0, pd.NA)
+    stoch_rsi = ((rsi_series - min_rsi) / denom) * 100
+
+    k = stoch_rsi.rolling(window=k_smooth).mean()
+    d = k.rolling(window=d_smooth).mean()
+
+    k_val = k.iloc[-1]
+    d_val = d.iloc[-1]
+
+    if pd.isna(k_val) or pd.isna(d_val):
+        return None, None
+
+    return float(k_val), float(d_val)
+
+
 def get_market_overview() -> str:
     ihsg = dsm.yahoo.get_ihsg()
     if ihsg.empty:
@@ -229,6 +266,95 @@ def get_stock_info(ticker: str) -> str:
     return "\n".join(lines)
 
 
+def compute_atr(hist: pd.DataFrame, period: int = 14) -> float:
+    """Average True Range — dasar perhitungan volatilitas untuk SL/TP."""
+    high = hist["High"]
+    low = hist["Low"]
+    close = hist["Close"]
+    prev_close = close.shift(1)
+
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    atr = tr.rolling(window=period).mean().iloc[-1]
+    return float(atr) if not pd.isna(atr) else None
+
+
+def build_trading_plan(hist: pd.DataFrame, last_price: float, rsi: float, trend_bullish: bool,
+                        stoch_k: float = None, stoch_d: float = None) -> dict:
+    """
+    Bangun rencana trading (support/resistance, entry, SL, TP1-3, RR)
+    berbasis ATR dan swing high/low dari data histori riil.
+    """
+    atr = compute_atr(hist)
+    if atr is None or atr == 0:
+        return None
+
+    lookback = hist.tail(20)
+    support = float(lookback["Low"].min())
+    resistance = float(lookback["High"].max())
+
+    entry = last_price
+    sl = min(support, entry - 1.5 * atr)
+    risk = entry - sl
+
+    if risk <= 0:
+        risk = atr
+
+    tp1 = entry + 1.0 * atr
+    tp2 = entry + 2.0 * atr
+    tp3 = max(entry + 3.0 * atr, resistance)
+
+    rr1 = (tp1 - entry) / risk
+    rr2 = (tp2 - entry) / risk
+    rr3 = (tp3 - entry) / risk
+
+    # StochRSI lebih sensitif dari RSI biasa untuk deteksi jenuh beli/jual dini
+    stoch_overbought = stoch_k is not None and stoch_k >= 80
+    stoch_oversold = stoch_k is not None and stoch_k <= 20
+
+    if rsi is not None and rsi >= 70 and stoch_overbought:
+        recommendation = (
+            f"RSI ({rsi:.1f}) DAN StochRSI ({stoch_k:.1f}) sama-sama overbought — sinyal jenuh beli kuat. "
+            f"Tunggu koreksi ke area Support (~{fmt_num(support)}) sebelum entry baru. Jangan FOMO."
+        )
+    elif rsi is not None and rsi >= 70:
+        recommendation = (
+            "RSI menunjukkan overbought — risiko koreksi jangka pendek meningkat. "
+            "Entry baru lebih disiplin menunggu retracement ke area Support/MA20 "
+            "daripada mengejar harga di titik ini."
+        )
+    elif stoch_oversold and rsi is not None and rsi <= 45:
+        recommendation = (
+            f"StochRSI ({stoch_k:.1f}) di area jenuh jual dan RSI melemah — berpotensi rebound teknikal, "
+            "tapi tetap tunggu konfirmasi candle & volume sebelum entry."
+        )
+    elif rsi is not None and rsi <= 30:
+        recommendation = (
+            "RSI oversold — berpotensi rebound teknikal, tapi konfirmasi dulu dengan "
+            "volume & price action sebelum entry, jangan asal beli di harga jatuh."
+        )
+    elif trend_bullish:
+        recommendation = "Trend bullish & momentum RSI netral — struktur mendukung entry dengan manajemen risiko ketat."
+    else:
+        recommendation = "Trend bearish jangka pendek — pertimbangkan tunggu konfirmasi reversal sebelum entry."
+
+    return {
+        "support": support,
+        "resistance": resistance,
+        "atr": atr,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1, "rr1": rr1,
+        "tp2": tp2, "rr2": rr2,
+        "tp3": tp3, "rr3": rr3,
+        "recommendation": recommendation,
+    }
+
+
 def get_technical_analysis(ticker: str, period: str = "6mo") -> str:
     ticker = normalize_ticker(ticker)
     hist = dsm.yahoo.get_history(ticker, period=period)
@@ -241,10 +367,12 @@ def get_technical_analysis(ticker: str, period: str = "6mo") -> str:
     ma20 = close.rolling(window=20).mean().iloc[-1]
     ma50 = close.rolling(window=50).mean().iloc[-1] if len(close) >= 50 else None
     rsi = compute_rsi(close)
+    stoch_k, stoch_d = compute_stochrsi(close)
     avg_volume = hist["Volume"].tail(20).mean()
     last_volume = hist["Volume"].iloc[-1]
 
-    trend_ma20 = "di atas MA20 (bullish jangka pendek)" if last_price > ma20 else "di bawah MA20 (bearish jangka pendek)"
+    trend_bullish = last_price > ma20
+    trend_ma20 = "di atas MA20 (bullish jangka pendek)" if trend_bullish else "di bawah MA20 (bearish jangka pendek)"
     trend_ma50 = ""
     if ma50 is not None:
         trend_ma50 = "di atas MA50 (bullish jangka menengah)" if last_price > ma50 else "di bawah MA50 (bearish jangka menengah)"
@@ -258,6 +386,15 @@ def get_technical_analysis(ticker: str, period: str = "6mo") -> str:
     else:
         rsi_note = f"{rsi:.1f} (netral)"
 
+    if stoch_k is None:
+        stoch_note = "N/A"
+    elif stoch_k >= 80:
+        stoch_note = f"%K {stoch_k:.1f} / %D {stoch_d:.1f} (jenuh beli)"
+    elif stoch_k <= 20:
+        stoch_note = f"%K {stoch_k:.1f} / %D {stoch_d:.1f} (jenuh jual)"
+    else:
+        stoch_note = f"%K {stoch_k:.1f} / %D {stoch_d:.1f} (netral)"
+
     volume_note = "di atas rata-rata 20 hari" if last_volume > avg_volume else "di bawah rata-rata 20 hari"
 
     lines = [
@@ -268,7 +405,26 @@ def get_technical_analysis(ticker: str, period: str = "6mo") -> str:
     if ma50 is not None:
         lines.append(f"MA50: {fmt_num(ma50)} → harga {trend_ma50}")
     lines.append(f"RSI(14): {rsi_note}")
+    lines.append(f"StochRSI(14,14,3,3): {stoch_note}")
     lines.append(f"Volume: {fmt_num(last_volume, 0)} ({volume_note})")
+
+    plan = build_trading_plan(hist, float(last_price), rsi, trend_bullish, stoch_k, stoch_d)
+    if plan:
+        lines.append("")
+        lines.append("📐 *Trading Plan* (berbasis ATR & Support/Resistance)")
+        lines.append(f"Support: {fmt_num(plan['support'])}  |  Resistance: {fmt_num(plan['resistance'])}")
+        lines.append(f"ATR(14): {fmt_num(plan['atr'])}")
+        lines.append("")
+        lines.append(f"Entry: {fmt_num(plan['entry'])}")
+        lines.append(f"Stop Loss: {fmt_num(plan['sl'])}")
+        lines.append(f"TP1: {fmt_num(plan['tp1'])}  (RR {plan['rr1']:.1f}x)")
+        lines.append(f"TP2: {fmt_num(plan['tp2'])}  (RR {plan['rr2']:.1f}x)")
+        lines.append(f"TP3: {fmt_num(plan['tp3'])}  (RR {plan['rr3']:.1f}x)")
+        lines.append("")
+        lines.append(f"💡 {plan['recommendation']}")
+        lines.append("")
+        lines.append("_Ini kerangka teknikal otomatis berbasis data historis, bukan saran finansial personal. Selalu sesuaikan dengan manajemen risiko & kondisi pasar terkini._")
+
     return "\n".join(lines)
 
 
