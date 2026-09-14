@@ -132,6 +132,31 @@ class YahooFinanceSource:
 
     def __init__(self, cache: TTLCache):
         self.cache = cache
+        self._session = self._build_session()
+
+    @staticmethod
+    def _build_session():
+        """
+        Yahoo Finance mem-blokir request yang terdeteksi berasal dari
+        script/bot (termasuk IP server cloud seperti Render), ditandai
+        dengan error 'Invalid Crumb' / HTTP 401.
+
+        Solusi: gunakan curl_cffi untuk meniru fingerprint TLS browser
+        Chrome asli, supaya request kita tidak dikenali sebagai bot.
+        Ini adalah workaround yang direkomendasikan komunitas yfinance
+        untuk masalah ini.
+        """
+        try:
+            from curl_cffi import requests as curl_requests
+            return curl_requests.Session(impersonate="chrome")
+        except ImportError:
+            logger.warning("curl_cffi tidak terpasang, fallback ke session requests biasa (rawan error crumb).")
+            return None
+
+    def _get_ticker(self, yahoo_ticker: str):
+        if self._session is not None:
+            return yf.Ticker(yahoo_ticker, session=self._session)
+        return yf.Ticker(yahoo_ticker)
 
     @staticmethod
     def to_yahoo_ticker(ticker: str) -> str:
@@ -148,7 +173,7 @@ class YahooFinanceSource:
         yt = self.to_yahoo_ticker(ticker_clean)
 
         try:
-            tk = yf.Ticker(yt)
+            tk = self._get_ticker(yt)
         except Exception as e:
             logger.error("Gagal membuat Yahoo Ticker %s: %s", yt, e)
             return None
@@ -244,10 +269,10 @@ class YahooFinanceSource:
         return result
 
     def get_history(self, ticker: str, period: str = "1y") -> pd.DataFrame:
-        return yf.Ticker(self.to_yahoo_ticker(ticker)).history(period=period, auto_adjust=False)
+        return self._get_ticker(self.to_yahoo_ticker(ticker)).history(period=period, auto_adjust=False)
 
     def get_ihsg(self) -> pd.DataFrame:
-        return yf.Ticker("^JKSE").history(period="5d", auto_adjust=False)
+        return self._get_ticker("^JKSE").history(period="5d", auto_adjust=False)
 
 
 class WebScrapingSource:
@@ -260,17 +285,22 @@ class WebScrapingSource:
 
     def __init__(self, cache: TTLCache):
         self.cache = cache
+        try:
+            from curl_cffi import requests as curl_requests
+            self._session = curl_requests.Session(impersonate="chrome")
+        except ImportError:
+            self._session = None
 
     def _fetch(self, url: str) -> str:
-        resp = requests.get(
-            url,
-            timeout=15,
-            headers={
-                "User-Agent": self.USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-            },
-        )
+        headers = {
+            "User-Agent": self.USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        }
+        if self._session is not None:
+            resp = self._session.get(url, timeout=15, headers=headers)
+        else:
+            resp = requests.get(url, timeout=15, headers=headers)
         resp.raise_for_status()
         return resp.text
 
