@@ -1,8 +1,11 @@
+
+
 fastapi
 uvicorn
 python-telegram-bot
 groq
-yfinance
 requests
+yfinance>=0.2.50
 pandas
+curl_cffi
 
